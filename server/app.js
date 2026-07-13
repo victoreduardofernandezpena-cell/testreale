@@ -1,0 +1,111 @@
+import express from 'express'
+import cookieParser from 'cookie-parser'
+import cors from 'cors'
+import helmet from 'helmet'
+import { rateLimit } from 'express-rate-limit'
+import { Prisma } from '@prisma/client'
+import { z } from 'zod'
+import { db as defaultDb } from './db.js'
+import { env } from './config.js'
+import { appointmentSchema, credentialsSchema, parse, petSchema, profileSchema, registerSchema } from './validation.js'
+import { clearSessionCookie, createSession, hashPassword, hashToken, newToken, publicUser, requireAuth, requireRole, verifyOrigin, verifyPassword } from './security.js'
+
+const asyncRoute=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
+const authLimit=rateLimit({windowMs:15*60*1000,limit:12,standardHeaders:'draft-8',legacyHeaders:false,message:{error:'RATE_LIMITED',message:'Demasiados intentos. Espera unos minutos.'}})
+const actionLimit=rateLimit({windowMs:10*60*1000,limit:30,standardHeaders:'draft-8',legacyHeaders:false,message:{error:'RATE_LIMITED',message:'Demasiadas solicitudes. Intenta más tarde.'}})
+const idSchema=z.string().cuid()
+const cartItemSchema=z.object({productId:idSchema,variantId:idSchema.nullable().optional(),quantity:z.coerce.number().int().min(1).max(50)})
+const catalogProductSchema=z.object({slug:z.string().regex(/^[a-z0-9-]+$/).max(120),name:z.string().min(2).max(160),description:z.string().min(2).max(5000),category:z.string().min(1).max(80),sku:z.string().min(1).max(80),price:z.coerce.number().nonnegative().nullable().optional(),promotionalPrice:z.coerce.number().nonnegative().nullable().optional(),stock:z.coerce.number().int().nonnegative().default(0),active:z.boolean().default(true),images:z.array(z.string().url()).max(8).default([]),information:z.string().max(5000).nullable().optional()})
+
+function sanitizePet(pet,includeSensitive=false){const base={id:pet.id,name:pet.name,species:pet.species,breed:pet.breed,birthDate:pet.birthDate,ageLabel:pet.ageLabel,sex:pet.sex,weightKg:pet.weightKg,photoUrl:pet.photoUrl,notes:pet.notes,createdAt:pet.createdAt,updatedAt:pet.updatedAt};return includeSensitive?{...base,allergies:pet.allergies,conditions:pet.conditions}:base}
+async function getCart(db,userId){return db.cart.findFirst({where:{userId,status:'ACTIVE'},include:{items:{include:{product:true,variant:true}}},orderBy:{createdAt:'desc'}})}
+function requestCode(prefix){return `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`}
+
+export function createApp({db=defaultDb}={}){
+ const app=express()
+ app.set('trust proxy',1)
+ app.use(helmet({crossOriginResourcePolicy:{policy:'cross-origin'}}))
+ app.use(cors({origin:env.APP_ORIGIN,credentials:true}))
+ app.use(express.json({limit:'300kb'}))
+ app.use(cookieParser())
+ app.use(verifyOrigin)
+ const auth=requireAuth(db)
+
+ app.get('/api/health',asyncRoute(async(_req,res)=>{await db.$queryRaw`SELECT 1`;res.json({status:'ok',database:'connected'})}))
+
+ app.post('/api/auth/register',authLimit,asyncRoute(async(req,res)=>{
+  const data=parse(registerSchema,req.body),exists=await db.user.findUnique({where:{email:data.email},select:{id:true}})
+  if(exists)return res.status(409).json({error:'EMAIL_IN_USE',message:'Ya existe una cuenta con ese correo.'})
+  const user=await db.user.create({data:{email:data.email,name:data.name,phone:data.phone,passwordHash:await hashPassword(data.password)}})
+  await createSession(db,user.id,res);res.status(201).json({user:publicUser(user)})
+ }))
+ app.post('/api/auth/login',authLimit,asyncRoute(async(req,res)=>{
+  const data=parse(credentialsSchema,req.body),user=await db.user.findUnique({where:{email:data.email}})
+  if(!user||!await verifyPassword(data.password,user.passwordHash))return res.status(401).json({error:'INVALID_CREDENTIALS',message:'Correo o contraseña incorrectos.'})
+  await createSession(db,user.id,res);res.json({user:publicUser(user)})
+ }))
+ app.post('/api/auth/logout',auth,asyncRoute(async(req,res)=>{await db.session.delete({where:{id:req.auth.sessionId}}).catch(()=>{});clearSessionCookie(res);res.status(204).end()}))
+ app.get('/api/auth/session',auth,asyncRoute(async(req,res)=>res.json({user:publicUser(req.auth.user)})))
+ app.post('/api/auth/request-password-reset',authLimit,asyncRoute(async(req,res)=>{
+  const email=parse(z.object({email:z.string().email().transform(v=>v.toLowerCase())}),req.body).email,user=await db.user.findUnique({where:{email}})
+  if(user&&env.EMAIL_API_KEY&&env.EMAIL_FROM){const token=newToken();await db.passwordResetToken.create({data:{userId:user.id,tokenHash:hashToken(token),expiresAt:new Date(Date.now()+30*60*1000)}});/* Connect the approved email provider here; never return the token. */}
+  res.json({message:'Si la cuenta existe, recibirás instrucciones para restablecer la contraseña.',deliveryConfigured:Boolean(env.EMAIL_API_KEY&&env.EMAIL_FROM)})
+ }))
+ app.post('/api/auth/reset-password',authLimit,asyncRoute(async(req,res)=>{
+  const data=parse(z.object({token:z.string().min(32),password:z.string().min(10).max(128)}),req.body),token=await db.passwordResetToken.findUnique({where:{tokenHash:hashToken(data.token)}})
+  if(!token||token.usedAt||token.expiresAt<=new Date())return res.status(400).json({error:'INVALID_RESET_TOKEN',message:'El enlace no es válido o expiró.'})
+  await db.$transaction([db.user.update({where:{id:token.userId},data:{passwordHash:await hashPassword(data.password)}}),db.passwordResetToken.update({where:{id:token.id},data:{usedAt:new Date()}}),db.session.deleteMany({where:{userId:token.userId}})])
+  clearSessionCookie(res);res.json({message:'Contraseña actualizada. Inicia sesión nuevamente.'})
+ }))
+
+ app.get('/api/me',auth,asyncRoute(async(req,res)=>res.json({user:publicUser(req.auth.user)})))
+ app.patch('/api/me',auth,asyncRoute(async(req,res)=>{const data=parse(profileSchema,req.body),user=await db.user.update({where:{id:req.auth.user.id},data});res.json({user:publicUser(user)})}))
+
+ app.get('/api/pets',auth,asyncRoute(async(req,res)=>{const pets=await db.pet.findMany({where:{userId:req.auth.user.id},orderBy:{createdAt:'asc'}});res.json({pets:pets.map(p=>sanitizePet(p,true))})}))
+ app.post('/api/pets',auth,actionLimit,asyncRoute(async(req,res)=>{const data=parse(petSchema,req.body),pet=await db.pet.create({data:{...data,userId:req.auth.user.id,weightKg:data.weightKg===null||data.weightKg===undefined?null:new Prisma.Decimal(data.weightKg)}});res.status(201).json({pet:sanitizePet(pet,true)})}))
+ app.patch('/api/pets/:id',auth,asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),data=parse(petSchema.partial(),req.body),owned=await db.pet.findFirst({where:{id,userId:req.auth.user.id},select:{id:true}});if(!owned)return res.status(404).json({error:'PET_NOT_FOUND',message:'Mascota no encontrada.'});const pet=await db.pet.update({where:{id},data:{...data,weightKg:data.weightKg===null?null:data.weightKg===undefined?undefined:new Prisma.Decimal(data.weightKg)}});res.json({pet:sanitizePet(pet,true)})}))
+ app.delete('/api/pets/:id',auth,asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),owned=await db.pet.findFirst({where:{id,userId:req.auth.user.id},include:{appointments:{where:{status:{in:['PENDING','CONFIRMED','RESCHEDULE_REQUESTED']}},select:{id:true}}}});if(!owned)return res.status(404).json({error:'PET_NOT_FOUND',message:'Mascota no encontrada.'});if(owned.appointments.length)return res.status(409).json({error:'PET_HAS_ACTIVE_APPOINTMENTS',message:'No puedes eliminar una mascota con citas activas.'});await db.pet.delete({where:{id}});res.status(204).end()}))
+ app.post('/api/pets/:id/photo',auth,actionLimit,(_req,res)=>res.status(503).json({error:'PHOTO_STORAGE_NOT_CONFIGURED',message:'La carga de fotografías requiere configurar un proveedor privado de almacenamiento.',required:['PHOTO_STORAGE_PROVIDER']}))
+
+ app.get('/api/catalog/services',asyncRoute(async(_req,res)=>res.json({services:await db.service.findMany({where:{active:true},orderBy:{name:'asc'}})})))
+ app.get('/api/catalog/products',asyncRoute(async(req,res)=>{
+  const q=String(req.query.q||'').slice(0,100),category=String(req.query.category||'').slice(0,80)
+  const products=await db.product.findMany({where:{active:true,...(q?{OR:[{name:{contains:q,mode:'insensitive'}},{description:{contains:q,mode:'insensitive'}}]}:{}),...(category?{category}:{})},include:{variants:{where:{active:true}}},orderBy:{name:'asc'}})
+  res.json({products})
+ }))
+
+ app.get('/api/favorites',auth,asyncRoute(async(req,res)=>{const userId=req.auth.user.id;const [products,services]=await Promise.all([db.favoriteProduct.findMany({where:{userId},include:{product:true}}),db.favoriteService.findMany({where:{userId},include:{service:true}})]);res.json({products:products.map(x=>x.product),services:services.map(x=>x.service)})}))
+ app.put('/api/favorites/products/:productId',auth,asyncRoute(async(req,res)=>{const productId=parse(idSchema,req.params.productId);await db.favoriteProduct.upsert({where:{userId_productId:{userId:req.auth.user.id,productId}},create:{userId:req.auth.user.id,productId},update:{}});res.status(204).end()}))
+ app.delete('/api/favorites/products/:productId',auth,asyncRoute(async(req,res)=>{const productId=parse(idSchema,req.params.productId);await db.favoriteProduct.deleteMany({where:{userId:req.auth.user.id,productId}});res.status(204).end()}))
+ app.put('/api/favorites/services/:serviceId',auth,asyncRoute(async(req,res)=>{const serviceId=parse(idSchema,req.params.serviceId);await db.favoriteService.upsert({where:{userId_serviceId:{userId:req.auth.user.id,serviceId}},create:{userId:req.auth.user.id,serviceId},update:{}});res.status(204).end()}))
+ app.delete('/api/favorites/services/:serviceId',auth,asyncRoute(async(req,res)=>{const serviceId=parse(idSchema,req.params.serviceId);await db.favoriteService.deleteMany({where:{userId:req.auth.user.id,serviceId}});res.status(204).end()}))
+
+ app.get('/api/cart',auth,asyncRoute(async(req,res)=>res.json({cart:await getCart(db,req.auth.user.id)})))
+ app.post('/api/cart/items',auth,actionLimit,asyncRoute(async(req,res)=>{const data=parse(cartItemSchema,req.body),product=await db.product.findFirst({where:{id:data.productId,active:true},include:{variants:true}});if(!product)return res.status(404).json({error:'PRODUCT_NOT_FOUND',message:'Producto no disponible.'});const variant=data.variantId?product.variants.find(v=>v.id===data.variantId&&v.active):null;if(data.variantId&&!variant)return res.status(400).json({error:'VARIANT_NOT_AVAILABLE',message:'Variante no disponible.'});const available=variant?variant.stock:product.stock;if(data.quantity>available)return res.status(409).json({error:'INSUFFICIENT_STOCK',message:`Solo hay ${available} unidades disponibles.`});let cart=await getCart(db,req.auth.user.id);if(!cart)cart=await db.cart.create({data:{userId:req.auth.user.id},include:{items:true}});const existing=await db.cartItem.findFirst({where:{cartId:cart.id,productId:data.productId,variantId:data.variantId||null}}),nextQty=(existing?.quantity||0)+data.quantity;if(nextQty>available)return res.status(409).json({error:'INSUFFICIENT_STOCK',message:`Solo hay ${available} unidades disponibles.`});if(existing)await db.cartItem.update({where:{id:existing.id},data:{quantity:nextQty}});else await db.cartItem.create({data:{cartId:cart.id,...data,variantId:data.variantId||null}});res.status(201).json({cart:await getCart(db,req.auth.user.id)})}))
+ app.patch('/api/cart/items/:id',auth,asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),quantity=parse(z.object({quantity:z.coerce.number().int().min(1).max(50)}),req.body).quantity,item=await db.cartItem.findFirst({where:{id,cart:{userId:req.auth.user.id,status:'ACTIVE'}},include:{product:true,variant:true}});if(!item)return res.status(404).json({error:'CART_ITEM_NOT_FOUND',message:'Artículo no encontrado.'});const available=item.variant?.stock??item.product.stock;if(quantity>available)return res.status(409).json({error:'INSUFFICIENT_STOCK',message:`Solo hay ${available} unidades disponibles.`});await db.cartItem.update({where:{id},data:{quantity}});res.json({cart:await getCart(db,req.auth.user.id)})}))
+ app.delete('/api/cart/items/:id',auth,asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id);await db.cartItem.deleteMany({where:{id,cart:{userId:req.auth.user.id,status:'ACTIVE'}}});res.status(204).end()}))
+ app.post('/api/cart/items/:id/save-for-later',auth,asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),item=await db.cartItem.findFirst({where:{id,cart:{userId:req.auth.user.id,status:'ACTIVE'}}});if(!item)return res.status(404).json({error:'CART_ITEM_NOT_FOUND',message:'Artículo no encontrado.'});await db.$transaction([db.favoriteProduct.upsert({where:{userId_productId:{userId:req.auth.user.id,productId:item.productId}},create:{userId:req.auth.user.id,productId:item.productId},update:{}}),db.cartItem.delete({where:{id}})]);res.status(204).end()}))
+
+ app.get('/api/appointments',auth,asyncRoute(async(req,res)=>res.json({appointments:await db.appointment.findMany({where:{userId:req.auth.user.id},include:{pet:true,services:{include:{service:true}}},orderBy:{requestedAt:'desc'}})})))
+ app.post('/api/appointments',auth,actionLimit,asyncRoute(async(req,res)=>{const data=parse(appointmentSchema,req.body),userId=req.auth.user.id,petIds=[...new Set(data.pets.map(p=>p.petId))],serviceIds=[...new Set(data.pets.flatMap(p=>p.serviceIds))];const [ownedPets,activeServices]=await Promise.all([db.pet.findMany({where:{id:{in:petIds},userId},select:{id:true}}),db.service.findMany({where:{id:{in:serviceIds},active:true},select:{id:true}})]);if(ownedPets.length!==petIds.length)return res.status(403).json({error:'INVALID_PET',message:'Una mascota no pertenece a tu cuenta.'});if(activeServices.length!==serviceIds.length)return res.status(400).json({error:'INVALID_SERVICE',message:'Uno de los servicios no está disponible.'});const group=requestCode('GRP'),created=await db.$transaction(data.pets.map(item=>db.appointment.create({data:{requestCode:requestCode('RE'),requestGroupId:group,userId,petId:item.petId,requestedAt:data.requestedAt,notes:data.notes,services:{create:item.serviceIds.map(serviceId=>({serviceId}))}},include:{pet:true,services:{include:{service:true}}}})));res.status(201).json({requestGroupId:group,appointments:created,status:'PENDING'})}))
+ app.post('/api/appointments/:id/request-reschedule',auth,actionLimit,asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),requestedAt=parse(z.object({requestedAt:z.coerce.date().refine(v=>v>Date.now())}),req.body).requestedAt,item=await db.appointment.findFirst({where:{id,userId:req.auth.user.id}});if(!item)return res.status(404).json({error:'APPOINTMENT_NOT_FOUND',message:'Solicitud no encontrada.'});if(!['PENDING','CONFIRMED'].includes(item.status))return res.status(409).json({error:'STATUS_NOT_ALLOWED',message:'Esta solicitud no puede reprogramarse.'});await db.appointment.update({where:{id},data:{requestedAt,status:'RESCHEDULE_REQUESTED'}});res.status(204).end()}))
+ app.post('/api/appointments/:id/cancel',auth,actionLimit,asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),item=await db.appointment.findFirst({where:{id,userId:req.auth.user.id}});if(!item)return res.status(404).json({error:'APPOINTMENT_NOT_FOUND',message:'Solicitud no encontrada.'});const hours=(item.requestedAt-Date.now())/3600000;if(item.status==='CONFIRMED'&&hours<24)return res.status(409).json({error:'CANCELLATION_WINDOW_CLOSED',message:'Contacta a RealEngo para cancelar con menos de 24 horas.'});if(!['PENDING','CONFIRMED','RESCHEDULE_REQUESTED'].includes(item.status))return res.status(409).json({error:'STATUS_NOT_ALLOWED',message:'Esta solicitud no puede cancelarse.'});await db.$transaction([db.appointmentSlot.deleteMany({where:{appointmentId:id}}),db.appointment.update({where:{id},data:{status:'CANCELLED'}})]);res.status(204).end()}))
+
+ app.get('/api/orders',auth,asyncRoute(async(req,res)=>res.json({orders:await db.order.findMany({where:{userId:req.auth.user.id},include:{items:true},orderBy:{createdAt:'desc'}})})))
+ app.post('/api/orders',auth,actionLimit,asyncRoute(async(req,res)=>{const cart=await getCart(db,req.auth.user.id);if(!cart?.items.length)return res.status(409).json({error:'EMPTY_CART',message:'El carrito está vacío.'});const order=await db.$transaction(async tx=>{let subtotal=new Prisma.Decimal(0);for(const item of cart.items){const price=item.variant?.price??item.product.promotionalPrice??item.product.price;if(price===null)return Promise.reject(Object.assign(new Error('PRICE_NOT_CONFIGURED'),{status:409,message:'Un producto todavía no tiene precio confirmado.'}));const updated=item.variantId?await tx.productVariant.updateMany({where:{id:item.variantId,stock:{gte:item.quantity}},data:{stock:{decrement:item.quantity}}}):await tx.product.updateMany({where:{id:item.productId,stock:{gte:item.quantity}},data:{stock:{decrement:item.quantity}}});if(updated.count!==1)return Promise.reject(Object.assign(new Error('INSUFFICIENT_STOCK'),{status:409,message:`No hay existencias suficientes de ${item.product.name}.`}));subtotal=subtotal.add(new Prisma.Decimal(price).mul(item.quantity))}const created=await tx.order.create({data:{orderCode:requestCode('ORD'),userId:req.auth.user.id,cartId:cart.id,subtotal,items:{create:cart.items.map(item=>{const price=item.variant?.price??item.product.promotionalPrice??item.product.price;return{productId:item.productId,variantId:item.variantId,name:item.product.name,sku:item.variant?.sku??item.product.sku,unitPrice:price,quantity:item.quantity}})}},include:{items:true}});await tx.cart.update({where:{id:cart.id},data:{status:'ORDERED'}});return created});res.status(201).json({order,status:'PENDING',payment:'NOT_CONFIGURED'})}))
+
+ const admin=express.Router();admin.use(auth,requireRole('ADMIN'))
+ admin.get('/overview',asyncRoute(async(_req,res)=>{const [users,pets,appointments,products,orders]=await Promise.all([db.user.count(),db.pet.count(),db.appointment.count(),db.product.count(),db.order.count()]);res.json({users,pets,appointments,products,orders})}))
+ admin.post('/products',asyncRoute(async(req,res)=>{const data=parse(catalogProductSchema,req.body),product=await db.product.create({data:{...data,price:data.price===null||data.price===undefined?null:new Prisma.Decimal(data.price),promotionalPrice:data.promotionalPrice===null||data.promotionalPrice===undefined?null:new Prisma.Decimal(data.promotionalPrice)}});res.status(201).json({product})}))
+ admin.patch('/products/:id',asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),data=parse(catalogProductSchema.partial(),req.body),product=await db.product.update({where:{id},data:{...data,price:data.price===null?null:data.price===undefined?undefined:new Prisma.Decimal(data.price),promotionalPrice:data.promotionalPrice===null?null:data.promotionalPrice===undefined?undefined:new Prisma.Decimal(data.promotionalPrice)}});res.json({product})}))
+ admin.get('/appointments',asyncRoute(async(_req,res)=>res.json({appointments:await db.appointment.findMany({include:{user:{select:{id:true,name:true,email:true}},pet:true,services:{include:{service:true}}},orderBy:{requestedAt:'asc'}})})))
+ admin.post('/appointments/:id/confirm',asyncRoute(async(req,res)=>{const id=parse(idSchema,req.params.id),resourceKey=parse(z.object({resourceKey:z.string().min(1).max(80).default('default')}),req.body||{}).resourceKey;try{const appointment=await db.$transaction(async tx=>{const item=await tx.appointment.findUnique({where:{id}});if(!item)throw Object.assign(new Error('APPOINTMENT_NOT_FOUND'),{status:404,message:'Solicitud no encontrada.'});const blocked=await tx.availabilityBlock.findFirst({where:{resourceKey,startsAt:{lte:item.requestedAt},endsAt:{gt:item.requestedAt}}});if(blocked)throw Object.assign(new Error('TIME_BLOCKED'),{status:409,message:'El horario está bloqueado.'});await tx.appointmentSlot.create({data:{appointmentId:id,startsAt:item.requestedAt,resourceKey}});return tx.appointment.update({where:{id},data:{status:'CONFIRMED'}})});res.json({appointment})}catch(error){if(error.code==='P2002')return res.status(409).json({error:'SLOT_ALREADY_BOOKED',message:'Ese horario ya fue asignado. Elige otro.'});throw error}}))
+ admin.post('/availability-blocks',asyncRoute(async(req,res)=>{const data=parse(z.object({startsAt:z.coerce.date(),endsAt:z.coerce.date(),resourceKey:z.string().min(1).max(80).default('default'),reason:z.string().max(300).nullable().optional()}).refine(v=>v.endsAt>v.startsAt,{message:'La hora final debe ser posterior.'}),req.body);res.status(201).json({block:await db.availabilityBlock.create({data})})}))
+ app.use('/api/admin',admin)
+
+ app.use('/api',(_req,res)=>res.status(404).json({error:'NOT_FOUND',message:'Ruta de API no encontrada.'}))
+ app.use((error,_req,res,_next)=>{if(error.status)return res.status(error.status).json({error:error.message==='VALIDATION_ERROR'?'VALIDATION_ERROR':error.message,message:error.message==='VALIDATION_ERROR'?'Revisa los datos enviados.':error.message,details:error.details});if(error.code==='P2002')return res.status(409).json({error:'CONFLICT',message:'El registro ya existe.'});console.error(error);res.status(500).json({error:'INTERNAL_ERROR',message:'No pudimos completar la solicitud.'})})
+ return app
+}
+
+export default createApp()
